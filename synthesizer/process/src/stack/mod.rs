@@ -64,7 +64,7 @@ use console::{
     },
     types::{Field, Group},
 };
-use ledger_block::{Deployment, Transition};
+use ledger_block::{Deployment, Transaction, Transition};
 use synthesizer_program::{CallOperator, Closure, Function, Instruction, Operand, Program, traits::*};
 use synthesizer_snark::{Certificate, ProvingKey, UniversalSRS, VerifyingKey};
 
@@ -135,9 +135,18 @@ impl<N: Network> CallStack<N> {
             CallStack::Authorize(requests, ..)
             | CallStack::Synthesize(requests, ..)
             | CallStack::CheckDeployment(requests, ..)
-            | CallStack::PackageRun(requests, ..) => requests.push(request),
-            CallStack::Evaluate(authorization) => authorization.push(request),
-            CallStack::Execute(authorization, ..) => authorization.push(request),
+            | CallStack::PackageRun(requests, ..) => {
+                // Check that the number of requests does not exceed the maximum.
+                ensure!(
+                    requests.len() < Transaction::<N>::MAX_TRANSITIONS,
+                    "The number of requests in the authorization cannot exceed '{}'.",
+                    Transaction::<N>::MAX_TRANSITIONS
+                );
+                // Push the request to the stack.
+                requests.push(request)
+            }
+            CallStack::Evaluate(authorization) => authorization.push(request)?,
+            CallStack::Execute(authorization, ..) => authorization.push(request)?,
         }
         Ok(())
     }
@@ -187,8 +196,6 @@ pub struct Stack<N: Network> {
     proving_keys: Arc<RwLock<IndexMap<Identifier<N>, ProvingKey<N>>>>,
     /// The mapping of function name to verifying key.
     verifying_keys: Arc<RwLock<IndexMap<Identifier<N>, VerifyingKey<N>>>>,
-    /// The mapping of function names to the number of function calls.
-    number_of_calls: IndexMap<Identifier<N>, usize>,
     /// The program address.
     program_address: Address<N>,
     /// The program edition.
@@ -362,18 +369,47 @@ impl<N: Network> StackProgram<N> for Stack<N> {
     fn get_number_of_calls(&self, function_name: &Identifier<N>) -> Result<usize> {
         // Initialize the base number of calls.
         let mut num_calls = 1;
-        // Determine the number of calls for the function.
-        for instruction in self.program.get_function_ref(function_name)?.instructions() {
-            if let Instruction::Call(call) = instruction {
-                // Determine if this is a function call.
-                if call.is_function_call(self)? {
-                    // Increment by the number of calls.
-                    num_calls += match call.operator() {
-                        CallOperator::Locator(locator) => {
-                            self.get_external_stack(locator.program_id())?.get_number_of_calls(locator.resource())?
+        // A helper enum to track stacks.
+        enum StackRef<'a, N: Network> {
+            // Self's stack.
+            Internal(&'a Stack<N>),
+            // An external stack.
+            External(Arc<Stack<N>>),
+        }
+        // Initialize a queue of functions to check.
+        let mut queue = vec![(StackRef::Internal(self), *function_name)];
+        // Iterate over the queue.
+        while let Some((stack_ref, function_name)) = queue.pop() {
+            // Ensure that the number of calls does not exceed the maximum.
+            // Note that one transition is reserved for the fee.
+            ensure!(
+                num_calls < Transaction::<N>::MAX_TRANSITIONS,
+                "Number of calls exceeds the maximum allowed number of transitions"
+            );
+
+            // Determine the number of calls for the function.
+            for instruction in match &stack_ref {
+                StackRef::Internal(stack) => stack.get_function_ref(&function_name)?.instructions(),
+                StackRef::External(stack) => stack.get_function_ref(&function_name)?.instructions(),
+            } {
+                if let Instruction::Call(call) = instruction {
+                    // Determine if this is a function call.
+                    if call.is_function_call(self)? {
+                        // Increment by the number of calls.
+                        num_calls += 1;
+                        // Add the function to the queue.
+                        match call.operator() {
+                            CallOperator::Locator(locator) => {
+                                queue.push((
+                                    StackRef::External(self.get_external_stack(locator.program_id())?),
+                                    *locator.resource(),
+                                ));
+                            }
+                            CallOperator::Resource(resource) => {
+                                queue.push((StackRef::Internal(self), *resource));
+                            }
                         }
-                        CallOperator::Resource(resource) => self.get_number_of_calls(resource)?,
-                    };
+                    }
                 }
             }
         }
